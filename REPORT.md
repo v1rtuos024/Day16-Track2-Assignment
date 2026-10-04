@@ -1,4 +1,4 @@
-1. Tôi dùng AWS, us-east-1, EC2 (x86_64, n_jobs=2), source commit [SHA].
+1. Tôi dùng AWS, us-east-1, EC2 (x86_64, n_jobs=2), source commit **d230103**.
 2. Dataset có 284.807 dòng (492 dòng fraud), chia train/validation/test 170.883 / 56.962 / 56.962 (tỉ lệ 60/20/20), seed 16.
 3. Load dữ liệu mất 2,50 giây; training mất 3,50 giây; best iteration là 68.
 4. AUC 0,9768, Accuracy 0,9995 (99,95%), F1 0,8478, Precision 0,9070, Recall 0,7959 trên tập test (decision threshold 0,5).

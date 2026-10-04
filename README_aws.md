@@ -117,6 +117,26 @@ ssh -i lab-key ubuntu@<BASTION_PUBLIC_IP>
 ssh ubuntu@<CPU_PRIVATE_IP>
 ```
 
+### Bước 4.1.1 — SSH qua Bastion với key ở laptop. Trong thư mục terraform/, tạo file ssh_config, thay hai IP bằng output thật:
+```bash
+Host lab-bastion
+    HostName <BASTION_PUBLIC_IP>
+    User ubuntu
+    IdentityFile ./lab-key
+    IdentitiesOnly yes
+
+Host lab-cpu
+    HostName <GPU_PRIVATE_IP>
+    User ubuntu
+    IdentityFile ./lab-key
+    IdentitiesOnly yes
+    ProxyJump lab-bastion
+```
+```bash
+ssh -F ssh_config lab-cpu
+```
+ProxyJump đi qua Bastion và dùng private key tại laptop để xác thực cả hai máy. Không cần copy private key lên Bastion. Hai lệnh SSH nối tiếp trong README cần thêm bước xác thực ở máy private; file config trên làm rõ bước đó. Tham khảo đường kết nối Bastion của AWS.
+
 ### Bước 4.2: Kiểm tra môi trường ML
 Terraform đã tự động cài sẵn Python, LightGBM, scikit-learn, pandas, numpy và Kaggle CLI cho bạn qua `user_data`. Đợi khoảng 1-2 phút sau khi instance chạy xong rồi kiểm tra:
 ```bash
@@ -145,6 +165,18 @@ chmod 600 ~/.kaggle/kaggle.json
 
 mkdir -p ~/ml-benchmark
 kaggle datasets download -d mlg-ulb/creditcardfraud --unzip -p ~/ml-benchmark/
+cd ~/ml-benchmark
+ls -lh creditcard.csv
+```
+**Xác nhận đúng dataset**
+```python
+python3 - <<'PY'
+import pandas as pd
+df = pd.read_csv("creditcard.csv")
+print("Shape:", df.shape)
+print("Missing:", int(df.isna().sum().sum()))
+print("Class counts:", df["Class"].value_counts().to_dict())
+PY
 ```
 
 ### Bước 4.4: Huấn luyện và Inference với LightGBM
@@ -157,20 +189,113 @@ Viết một script Python (ví dụ `benchmark.py`) thực hiện:
 5. Đo **inference latency** (dự đoán 1 dòng) và **inference throughput** (dự đoán 1000 dòng).
 6. Ghi toàn bộ kết quả ra file `benchmark_result.json`.
 
+```python
+import json
+import platform
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+ 
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import sklearn
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+ 
+seed = 16
+started = time.perf_counter()
+df = pd.read_csv("creditcard.csv")
+data_load_seconds = time.perf_counter() - started
+X, y = df.drop(columns="Class"), df["Class"]
+ 
+# 60% train, 20% validation, 20% test; cùng phân bố Class.
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=seed, stratify=y,
+)
+X_train, X_valid, y_train, y_valid = train_test_split(
+    X_trainval, y_trainval, test_size=0.25, random_state=seed,
+    stratify=y_trainval,
+)
+model = lgb.LGBMClassifier(
+    n_estimators=300, learning_rate=0.05, random_state=seed,
+    n_jobs=2, verbosity=-1,
+)
+started = time.perf_counter()
+model.fit(
+    X_train, y_train, eval_set=[(X_valid, y_valid)], eval_metric="auc",
+    callbacks=[lgb.early_stopping(20, verbose=False)],
+)
+training_seconds = time.perf_counter() - started
+ 
+probabilities = model.predict_proba(X_test)[:, 1]
+predictions = (probabilities >= 0.5).astype(int)
+one_row, batch = X_test.iloc[:1], X_test.iloc[:1000]
+model.predict_proba(one_row)  # Warm-up ngoài phần đo.
+model.predict_proba(batch)
+ 
+def measured_seconds(data, repeats):
+    elapsed = []
+    for _ in range(repeats):
+        started = time.perf_counter()
+        model.predict_proba(data)
+        elapsed.append(time.perf_counter() - started)
+    return float(np.median(elapsed))
+ 
+single_seconds = measured_seconds(one_row, 50)
+batch_seconds = measured_seconds(batch, 10)
+result = {
+    "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+    "architecture": platform.machine(),
+    "versions": {
+        "python": platform.python_version(), "lightgbm": lgb.__version__,
+        "sklearn": sklearn.__version__, "pandas": pd.__version__,
+        "numpy": np.__version__,
+    },
+    "dataset_rows": len(df), "fraud_rows": int(y.sum()), "seed": seed,
+    "split": {"train": len(X_train), "validation": len(X_valid), "test": len(X_test)},
+    "n_jobs": 2, "decision_threshold": 0.5,
+    "data_load_seconds": data_load_seconds,
+    "training_seconds": training_seconds,
+    "best_iteration": int(model.best_iteration_),
+    "auc_roc": float(roc_auc_score(y_test, probabilities)),
+    "accuracy": float(accuracy_score(y_test, predictions)),
+    "f1": float(f1_score(y_test, predictions, zero_division=0)),
+    "precision": float(precision_score(y_test, predictions, zero_division=0)),
+    "recall": float(recall_score(y_test, predictions, zero_division=0)),
+    "latency_1_row_ms": single_seconds * 1000,
+    "latency_repeats": 50,
+    "batch_rows": len(batch), "batch_repeats": 10,
+    "batch_1000_rows_seconds": batch_seconds,
+    "throughput_1000_rows_per_second": len(batch) / batch_seconds,
+    "timing_summary": "median; warm-up excluded; predict_proba on pandas input",
+}
+Path("benchmark_result.json").write_text(
+    json.dumps(result, indent=2, allow_nan=False), encoding="utf-8",
+)
+print(json.dumps(result, indent=2, allow_nan=False))
+```
+
+```python
+python3 benchmark.py
+python3 -m json.tool benchmark_result.json
+```
 Chạy script và điền kết quả vào bảng:
 
 | Metric | Kết quả |
-|---|---|
-| Thời gian load data | |
-| Thời gian training | |
-| Best iteration | |
-| AUC-ROC | |
-| Accuracy | |
-| F1-Score | |
-| Precision | |
-| Recall | |
-| Inference latency (1 row) | |
-| Inference throughput (1000 rows) | |
+| --- | --- |
+| Thời gian load data | 2.50 s |
+| Thời gian training | 3.50 s |
+| Best iteration | 68 |
+| AUC-ROC | 0.9768 |
+| Accuracy | 99.95% (0.9995) |
+| F1-Score | 0.8478 |
+| Precision | 0.9070 |
+| Recall | 0.7959 |
+| Inference latency (1 row) | 1.21 ms |
+| Inference throughput (1000 rows) | 308,986 rows/s |
 
 ---
 
@@ -213,6 +338,13 @@ Chỉ áp dụng nếu bạn đã làm Phụ lục GPU + LLM ở cuối bài. Ki
 
 ## Phần 6: Tiêu chí nộp bài (Deliverables)
 
+```bash
+cd terraform
+ls ssh_config lab-key
+mkdir -p ../submission
+scp -F ssh_config lab-cpu:ml-benchmark/benchmark.py \
+  lab-cpu:ml-benchmark/benchmark_result.json ../submission/
+```
 Để hoàn thành Lab 16, sinh viên cần thu thập và nộp các kết quả sau:
 1. **Screenshot terminal** chạy `python3 benchmark.py` với toàn bộ output kết quả.
 2. **File `benchmark_result.json`** chứa metrics đầy đủ (training time, AUC, inference latency, throughput...).
